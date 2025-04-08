@@ -1,5 +1,6 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, DurabilityPolicy, LivelinessPolicy
 from nav_msgs.msg import Odometry
 from scipy.spatial.transform import Rotation as R
 import numpy as np
@@ -17,11 +18,18 @@ class TrajectoryLogger(Node):
         self.declare_parameter("odom_topic", "/odom")
         odom_topic = self.get_parameter("odom_topic").get_parameter_value().string_value
 
+        qos_profile = QoSProfile(
+                    reliability=QoSReliabilityPolicy.BEST_EFFORT,
+                    history=QoSHistoryPolicy.KEEP_LAST,
+                    durability=DurabilityPolicy.VOLATILE,
+                    liveliness=LivelinessPolicy.AUTOMATIC,
+                    depth=1)
+        
         self.subscription = self.create_subscription(
             Odometry,
             odom_topic,
             self.odom_callback,
-            10
+            qos_profile
         )
 
         self.prev_time = None
@@ -30,9 +38,7 @@ class TrajectoryLogger(Node):
         self.timestamps = []
         self.xs = []
         self.ys = []
-        self.psis = []
         self.vxs = []
-        self.axs = []
 
         self.output_dir = Path(os.getcwd()) / "trajectory_logs"
         self.output_dir.mkdir(exist_ok=True)
@@ -77,10 +83,10 @@ class TrajectoryLogger(Node):
             x_np = np.array(self.xs)
             y_np = np.array(self.ys)
             vx_np = np.array(self.vxs)
-            ax_np = np.array(self.axs)
-            psi_np = np.array(self.psis)
 
             track = Track.from_refline(x_np, y_np, vx_np)
+            psi_np = np.array(track.raceline.yaws)
+            ax_np = np.array(track.raceline.axs)
 
             s_list = []
             kappa_list = []
