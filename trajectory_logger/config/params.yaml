@@ -1,0 +1,3 @@
+trajectory_logger:
+  ros__parameters:
+    odom_topic: "/odom"
