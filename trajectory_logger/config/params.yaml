@@ -1,3 +1,4 @@
 trajectory_logger:
   ros__parameters:
-    odom_topic: "/odom"
+    odom_topic: "/fixposition/odometry"
+    min_ds: 0.1

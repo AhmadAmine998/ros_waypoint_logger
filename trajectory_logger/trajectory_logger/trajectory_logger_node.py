@@ -17,6 +17,10 @@ class TrajectoryLogger(Node):
         # Declare and get the odometry topic parameter
         self.declare_parameter("odom_topic", "/odom")
         odom_topic = self.get_parameter("odom_topic").get_parameter_value().string_value
+        self.declare_parameter("min_ds", 0.1)
+        min_ds = self.get_parameter("min_ds").get_parameter_value().double_value
+        self.get_logger().info(f"Using minimum between points: {min_ds} m")
+        self.get_logger().info(f"Using odometry topic: {odom_topic}")
 
         qos_profile = QoSProfile(
                     reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -46,25 +50,30 @@ class TrajectoryLogger(Node):
         self.get_logger().info("Trajectory logger node started.")
 
     def odom_callback(self, msg):
+        self.get_logger().debug("Received odometry message.")
+        if msg is None:
+            self.get_logger().warn("Received empty odometry message.")
+            return
+        
         x = msg.pose.pose.position.x
         y = msg.pose.pose.position.y
+
+        # Check if the point is at least a minimum distance away from the previous point
+        if self.xs and self.ys:
+            prev_x = self.xs[-1]
+            prev_y = self.ys[-1]
+            distance = np.sqrt((x - prev_x)**2 + (y - prev_y)**2)
+            if distance < self.get_parameter("min_ds").get_parameter_value().double_value:
+                return
         q = msg.pose.pose.orientation
-        psi = self.quaternion_to_yaw(q.x, q.y, q.z, q.w)
         vx = msg.twist.twist.linear.x
 
         now = self.get_clock().now().nanoseconds * 1e-9
-        if self.prev_time is not None:
-            dt = now - self.prev_time
-            ax = (vx - self.prev_vx) / dt if dt > 1e-6 else 0.0
-        else:
-            ax = 0.0
 
         self.timestamps.append(now)
         self.xs.append(x)
         self.ys.append(y)
-        self.psis.append(psi)
         self.vxs.append(vx)
-        self.axs.append(ax)
 
         self.prev_time = now
         self.prev_vx = vx
@@ -125,6 +134,7 @@ class TrajectoryLogger(Node):
 
 def main(args=None):
     rclpy.init(args=args)
+    print("Starting logger node...")
     node = TrajectoryLogger()
     try:
         rclpy.spin(node)
@@ -132,4 +142,3 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
