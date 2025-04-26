@@ -15,7 +15,7 @@ class TrajectoryLogger(Node):
         super().__init__('trajectory_logger')
 
         # Declare and get the odometry topic parameter
-        self.declare_parameter("odom_topic", "/odom")
+        self.declare_parameter("odom_topic", "/ego_racecar/odom")
         odom_topic = self.get_parameter("odom_topic").get_parameter_value().string_value
         self.declare_parameter("min_ds", 0.1)
         min_ds = self.get_parameter("min_ds").get_parameter_value().double_value
@@ -36,13 +36,15 @@ class TrajectoryLogger(Node):
             qos_profile
         )
 
-        self.prev_time = None
+        self.prev_time = self.get_clock().now().seconds_nanoseconds()
+        self.prev_time = self.prev_time[0] + self.prev_time[1] * 1e-9
         self.prev_vx = None
 
         self.timestamps = []
         self.xs = []
         self.ys = []
         self.vxs = []
+        self.axs = []
 
         self.output_dir = Path(os.getcwd()) / "trajectory_logs"
         self.output_dir.mkdir(exist_ok=True)
@@ -68,12 +70,14 @@ class TrajectoryLogger(Node):
         q = msg.pose.pose.orientation
         vx = msg.twist.twist.linear.x
 
-        now = self.get_clock().now().nanoseconds * 1e-9
+        now = self.get_clock().now().seconds_nanoseconds()
+        now = now[0] + now[1] * 1e-9
 
         self.timestamps.append(now)
         self.xs.append(x)
         self.ys.append(y)
         self.vxs.append(vx)
+        self.axs.append((vx - self.prev_vx) / (now - self.prev_time) if self.prev_vx is not None else 0)
 
         self.prev_time = now
         self.prev_vx = vx
@@ -92,25 +96,31 @@ class TrajectoryLogger(Node):
             x_np = np.array(self.xs)
             y_np = np.array(self.ys)
             vx_np = np.array(self.vxs)
+            ax_np = np.array(self.axs)
 
+            # Create a raceline object to interpolate and calculate s, kappa
             track = Track.from_refline(x_np, y_np, vx_np)
-            psi_np = np.array(track.raceline.yaws)
-            ax_np = np.array(track.raceline.axs)
 
             s_list = []
             kappa_list = []
+            psi_list = []
             for i in range(len(x_np)):
-                s, _, _ = track.cartesian_to_frenet(x_np[i], y_np[i], psi_np[i])
+                s, _, _ = track.cartesian_to_frenet(x_np[i], y_np[i], 0.0)
+                # Calculate the yaw angle at the current point
+                psi_list.append(track.raceline.spline.calc_yaw(s))
                 kappa = track.raceline.spline.calc_curvature(s)
                 s_list.append(s)
                 kappa_list.append(kappa)
+            s_np = np.array(s_list)
+            kappa_np = np.array(kappa_list)
+            psi_np = np.array(psi_list)
 
             df = pd.DataFrame({
-                's_m': s_list,
+                's_m': s_np,
                 'x_m': x_np,
                 'y_m': y_np,
                 'psi_rad': psi_np,
-                'kappa_radpm': kappa_list,
+                'kappa_radpm': kappa_np,
                 'vx_mps': vx_np,
                 'ax_mps2': ax_np
             })
@@ -139,6 +149,11 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        pass
+        node.get_logger().info("Keyboard interrupt received. Shutting down...")
     finally:
         node.destroy_node()
+        rclpy.shutdown()
+        node.get_logger().info("Node destroyed. Shutdown complete.")
+
+if __name__ == '__main__':
+    main()
