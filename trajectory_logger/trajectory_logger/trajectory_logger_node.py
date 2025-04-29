@@ -7,20 +7,14 @@ import numpy as np
 import pandas as pd
 import os
 from pathlib import Path
-
-from f1tenth_gym.envs.track import Track
+from context_msgs.msg import (
+    STCombined,
+    STControl
+)
 
 class TrajectoryLogger(Node):
     def __init__(self):
         super().__init__('trajectory_logger')
-
-        # Declare and get the odometry topic parameter
-        self.declare_parameter("odom_topic", "/ego_racecar/odom")
-        odom_topic = self.get_parameter("odom_topic").get_parameter_value().string_value
-        self.declare_parameter("min_ds", 0.1)
-        min_ds = self.get_parameter("min_ds").get_parameter_value().double_value
-        self.get_logger().info(f"Using minimum between points: {min_ds} m")
-        self.get_logger().info(f"Using odometry topic: {odom_topic}")
 
         qos_profile = QoSProfile(
                     reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -28,13 +22,15 @@ class TrajectoryLogger(Node):
                     durability=DurabilityPolicy.VOLATILE,
                     liveliness=LivelinessPolicy.AUTOMATIC,
                     depth=1)
-        
-        self.subscription = self.create_subscription(
-            Odometry,
-            odom_topic,
-            self.odom_callback,
-            qos_profile
+
+        # Declare and get the odometry topic parameter
+        self.pose_sub = self.create_subscription(
+            STCombined, "/ground_truth/combined", self.state_callback, qos_profile
         )
+        self.declare_parameter("min_ds", 0.1)
+        min_ds = self.get_parameter("min_ds").get_parameter_value().double_value
+        self.get_logger().info(f"Using minimum between points: {min_ds} m")
+        # self.get_logger().info(f"Using vehicle state topic: {"/ground_truth/combined"}")
 
         self.prev_time = self.get_clock().now().seconds_nanoseconds()
         self.prev_time = self.prev_time[0] + self.prev_time[1] * 1e-9
@@ -45,30 +41,38 @@ class TrajectoryLogger(Node):
         self.ys = []
         self.vxs = []
         self.axs = []
+        self.min_num_points = 100
+        self.loop_back_threshold = 0.2
 
         self.output_dir = Path(os.getcwd()) / "trajectory_logs"
         self.output_dir.mkdir(exist_ok=True)
 
         self.get_logger().info("Trajectory logger node started.")
 
-    def odom_callback(self, msg):
+    def state_callback(self, msg):
         self.get_logger().debug("Received odometry message.")
         if msg is None:
             self.get_logger().warn("Received empty odometry message.")
             return
         
-        x = msg.pose.pose.position.x
-        y = msg.pose.pose.position.y
+        # [X, Y, V, YAW, YAW_RATE, SLIP_ANGLE]
+        x = msg.state.x
+        y = msg.state.y
 
-        # Check if the point is at least a minimum distance away from the previous point
         if self.xs and self.ys:
             prev_x = self.xs[-1]
             prev_y = self.ys[-1]
-            distance = np.sqrt((x - prev_x)**2 + (y - prev_y)**2)
+            distance = np.sqrt((x - prev_x) ** 2 + (y - prev_y) ** 2)
             if distance < self.get_parameter("min_ds").get_parameter_value().double_value:
                 return
-        q = msg.pose.pose.orientation
-        vx = msg.twist.twist.linear.x
+            
+        # If we have atleast num_points and we looped back to the start, shutdown
+        if len(self.xs) >= self.min_num_points and np.linalg.norm([x - self.xs[0], y - self.ys[0]]) < self.loop_back_threshold:
+            # Terminate the node 
+            self.get_logger().info("Looped back to start. Shutting down...")
+            raise KeyboardInterrupt # Hacky way to stop the node, but it works
+            
+        vx = msg.state.velocity * np.cos(msg.state.slip_angle)
 
         now = self.get_clock().now().seconds_nanoseconds()
         now = now[0] + now[1] * 1e-9
@@ -98,23 +102,30 @@ class TrajectoryLogger(Node):
             vx_np = np.array(self.vxs)
             ax_np = np.array(self.axs)
 
-            # Create a raceline object to interpolate and calculate s, kappa
-            track = Track.from_refline(x_np, y_np, vx_np)
+            dx = np.gradient(x_np, edge_order=2)
+            dy = np.gradient(y_np, edge_order=2)
+            s_np = np.sqrt(dx**2 + dy**2).cumsum()
 
-            s_list = []
-            kappa_list = []
-            psi_list = []
-            for i in range(len(x_np)):
-                s, _, _ = track.cartesian_to_frenet(x_np[i], y_np[i], 0.0)
-                # Calculate the yaw angle at the current point
-                psi_list.append(track.raceline.spline.calc_yaw(s))
-                kappa = track.raceline.spline.calc_curvature(s)
-                s_list.append(s)
-                kappa_list.append(kappa)
-            s_np = np.array(s_list)
-            kappa_np = np.array(kappa_list)
-            psi_np = np.array(psi_list)
+            # Calculate heading
+            psi_np = np.arctan2(dy, dx)
 
+            # Calculate curvature
+            # For more stable gradients, extend x and y by two (edge_order 2) elements on each side
+            # The elements are taken from the other side of the array
+            x = x_np.copy()
+            y = y_np.copy()
+            x_extended = np.concatenate((x[-2:], x, x[:2]))
+            y_extended = np.concatenate((y[-2:], y, y[:2]))
+            dx_dt = np.gradient(x_extended, edge_order=2)
+            dy_dt = np.gradient(y_extended, edge_order=2)
+            d2x_dt2 = np.gradient(dx_dt, edge_order=2)
+            d2y_dt2 = np.gradient(dy_dt, edge_order=2)
+            denominator = (dx_dt * dx_dt + dy_dt * dy_dt)**1.5
+            # Avoid division by zero
+            denominator[denominator == 0] = np.finfo(float).eps
+            kappa_np = (dx_dt * d2y_dt2 - d2x_dt2 * dy_dt) / denominator
+
+            # CAlculate teh
             df = pd.DataFrame({
                 's_m': s_np,
                 'x_m': x_np,
