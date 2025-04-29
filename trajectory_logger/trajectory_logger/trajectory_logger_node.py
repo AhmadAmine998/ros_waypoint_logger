@@ -1,27 +1,32 @@
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, DurabilityPolicy, LivelinessPolicy
+from rclpy.qos import (
+    QoSProfile,
+    QoSReliabilityPolicy,
+    QoSHistoryPolicy,
+    DurabilityPolicy,
+    LivelinessPolicy,
+)
 from nav_msgs.msg import Odometry
 from scipy.spatial.transform import Rotation as R
 import numpy as np
 import pandas as pd
 import os
 from pathlib import Path
-from context_msgs.msg import (
-    STCombined,
-    STControl
-)
+from context_msgs.msg import STCombined, STControl
+
 
 class TrajectoryLogger(Node):
     def __init__(self):
-        super().__init__('trajectory_logger')
+        super().__init__("trajectory_logger")
 
         qos_profile = QoSProfile(
-                    reliability=QoSReliabilityPolicy.BEST_EFFORT,
-                    history=QoSHistoryPolicy.KEEP_LAST,
-                    durability=DurabilityPolicy.VOLATILE,
-                    liveliness=LivelinessPolicy.AUTOMATIC,
-                    depth=1)
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            durability=DurabilityPolicy.VOLATILE,
+            liveliness=LivelinessPolicy.AUTOMATIC,
+            depth=1,
+        )
 
         # Declare and get the odometry topic parameter
         self.pose_sub = self.create_subscription(
@@ -54,7 +59,7 @@ class TrajectoryLogger(Node):
         if msg is None:
             self.get_logger().warn("Received empty odometry message.")
             return
-        
+
         # [X, Y, V, YAW, YAW_RATE, SLIP_ANGLE]
         x = msg.state.x
         y = msg.state.y
@@ -63,15 +68,22 @@ class TrajectoryLogger(Node):
             prev_x = self.xs[-1]
             prev_y = self.ys[-1]
             distance = np.sqrt((x - prev_x) ** 2 + (y - prev_y) ** 2)
-            if distance < self.get_parameter("min_ds").get_parameter_value().double_value:
+            if (
+                distance
+                < self.get_parameter("min_ds").get_parameter_value().double_value
+            ):
                 return
-            
+
         # If we have atleast num_points and we looped back to the start, shutdown
-        if len(self.xs) >= self.min_num_points and np.linalg.norm([x - self.xs[0], y - self.ys[0]]) < self.loop_back_threshold:
-            # Terminate the node 
+        if (
+            len(self.xs) >= self.min_num_points
+            and np.linalg.norm([x - self.xs[0], y - self.ys[0]])
+            < self.loop_back_threshold
+        ):
+            # Terminate the node
             self.get_logger().info("Looped back to start. Shutting down...")
-            raise KeyboardInterrupt # Hacky way to stop the node, but it works
-            
+            raise KeyboardInterrupt  # Hacky way to stop the node, but it works
+
         vx = msg.state.velocity * np.cos(msg.state.slip_angle)
 
         now = self.get_clock().now().seconds_nanoseconds()
@@ -81,7 +93,11 @@ class TrajectoryLogger(Node):
         self.xs.append(x)
         self.ys.append(y)
         self.vxs.append(vx)
-        self.axs.append((vx - self.prev_vx) / (now - self.prev_time) if self.prev_vx is not None else 0)
+        self.axs.append(
+            (vx - self.prev_vx) / (now - self.prev_time)
+            if self.prev_vx is not None
+            else 0
+        )
 
         self.prev_time = now
         self.prev_vx = vx
@@ -89,7 +105,7 @@ class TrajectoryLogger(Node):
     @staticmethod
     def quaternion_to_yaw(x, y, z, w):
         r = R.from_quat([x, y, z, w])
-        return r.as_euler('zyx', degrees=False)[0]
+        return r.as_euler("zyx", degrees=False)[0]
 
     def save_data(self):
         if len(self.xs) < 2:
@@ -120,21 +136,23 @@ class TrajectoryLogger(Node):
             dy_dt = np.gradient(y_extended, edge_order=2)
             d2x_dt2 = np.gradient(dx_dt, edge_order=2)
             d2y_dt2 = np.gradient(dy_dt, edge_order=2)
-            denominator = (dx_dt * dx_dt + dy_dt * dy_dt)**1.5
+            denominator = (dx_dt * dx_dt + dy_dt * dy_dt) ** 1.5
             # Avoid division by zero
             denominator[denominator == 0] = np.finfo(float).eps
             kappa_np = (dx_dt * d2y_dt2 - d2x_dt2 * dy_dt) / denominator
 
             # CAlculate teh
-            df = pd.DataFrame({
-                's_m': s_np,
-                'x_m': x_np,
-                'y_m': y_np,
-                'psi_rad': psi_np,
-                'kappa_radpm': kappa_np,
-                'vx_mps': vx_np,
-                'ax_mps2': ax_np
-            })
+            df = pd.DataFrame(
+                {
+                    "s_m": s_np,
+                    "x_m": x_np,
+                    "y_m": y_np,
+                    "psi_rad": psi_np,
+                    "kappa_radpm": kappa_np[2:-2],
+                    "vx_mps": vx_np,
+                    "ax_mps2": ax_np,
+                }
+            )
 
             output_path = self.output_dir / "trajectory_log.csv"
 
@@ -142,7 +160,14 @@ class TrajectoryLogger(Node):
                 f.write("#\n")
                 f.write("#\n")
                 f.write("# s_m; x_m; y_m; psi_rad; kappa_radpm; vx_mps; ax_mps2\n")
-            df.to_csv(output_path, sep=';', index=False, header=False, mode='a', float_format='%.6f')
+            df.to_csv(
+                output_path,
+                sep=";",
+                index=False,
+                header=False,
+                mode="a",
+                float_format="%.6f",
+            )
 
             self.get_logger().info(f"Saved trajectory to: {output_path}")
         except Exception as e:
@@ -152,6 +177,7 @@ class TrajectoryLogger(Node):
         self.get_logger().info("Shutting down. Saving trajectory...")
         self.save_data()
         super().destroy_node()
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -166,5 +192,6 @@ def main(args=None):
         rclpy.shutdown()
         node.get_logger().info("Node destroyed. Shutdown complete.")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
