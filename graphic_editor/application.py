@@ -14,9 +14,111 @@ from PyQt6.QtWidgets import (
     QLabel,
 )
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QPointF
+from PyQt6.QtGui import QPainterPath
 
 from waypoints_loader import load_waypoints
+
+
+class MultiColorLine(pg.GraphicsObject):
+    """A graphics object that displays a multi-colored line with colors determined by values."""
+
+    def __init__(self, x, y, values, colormap, width=1, connect="all"):
+        """
+        Parameters:
+        -----------
+        x, y : array-like
+            Arrays of x and y coordinates
+        values : array-like
+            Array of values used to determine the color at each point
+        colormap : pg.ColorMap
+            PyQtGraph colormap used to map values to colors
+        width : int, optional
+            Line width
+        connect : str or array, optional
+            Same meaning as for pg.PlotDataItem
+        """
+        pg.GraphicsObject.__init__(self)
+        self.x = np.asarray(x)
+        self.y = np.asarray(y)
+        self.values = np.asarray(values)
+        self.colormap = colormap
+        self.width = width
+
+        # Determine connection points
+        if connect == "all":
+            self.connect_array = np.ones(len(self.x) - 1, dtype=bool)
+        elif connect == "pairs":
+            self.connect_array = np.zeros(len(self.x) - 1, dtype=bool)
+            self.connect_array[::2] = True
+        elif connect == "finite":
+            self.connect_array = (
+                np.isfinite(self.x[:-1])
+                & np.isfinite(self.x[1:])
+                & np.isfinite(self.y[:-1])
+                & np.isfinite(self.y[1:])
+            )
+        else:
+            self.connect_array = connect
+
+        self.path = None
+        self.generatePath()
+
+    def generatePath(self):
+        self.path = QPainterPath()
+
+        # Create path
+        for i in range(len(self.x) - 1):
+            if self.connect_array[i]:
+                # Add line segment
+                self.path.moveTo(self.x[i], self.y[i])
+                self.path.lineTo(self.x[i + 1], self.y[i + 1])
+
+    def boundingRect(self):
+        if self.path is None:
+            return pg.QtCore.QRectF()
+        return self.path.boundingRect()
+
+    def paint(self, painter, option, widget):
+        if self.path is None:
+            return
+
+        painter.setRenderHint(painter.RenderHint.Antialiasing)
+
+        # Find min/max for color scaling
+        v_min = np.min(self.values)
+        v_max = np.max(self.values)
+        v_range = max(0.1, v_max - v_min)  # Avoid division by zero
+
+        # Draw each segment with a color based on its value
+        for i in range(len(self.x) - 1):
+            if self.connect_array[i]:
+                # Calculate color
+                norm_v = (self.values[i] - v_min) / v_range
+                qcolor = self.colormap.mapToQColor(norm_v)
+
+                # Set pen color
+                pen = pg.mkPen(color=qcolor, width=self.width)
+                painter.setPen(pen)
+
+                # Draw line segment
+                painter.drawLine(
+                    QPointF(self.x[i], self.y[i]), QPointF(self.x[i + 1], self.y[i + 1])
+                )
+
+    def setData(self, x, y, values):
+        """Update the data in the line."""
+        self.x = np.asarray(x)
+        self.y = np.asarray(y)
+        self.values = np.asarray(values)
+
+        # Recompute connect_array if length changed
+        if len(self.connect_array) != len(self.x) - 1:
+            self.connect_array = np.ones(len(self.x) - 1, dtype=bool)
+
+        self.generatePath()
+        self.prepareGeometryChange()
+        self.update()
 
 
 def spline_sample_closed(control_pts, num_points, cs_vel, s_max):
@@ -380,6 +482,11 @@ class MainWindow(QMainWindow):
 
         self.spline_curve = pg.PlotDataItem(pen=pg.mkPen("r", width=4))
         self.plot.addItem(self.spline_curve)
+
+        # Initialize colored segments lists for both plots
+        self.colored_vel_segments = []
+        self.colored_pos_segments = []
+
         self.update_spline(self.ctrl_pts)
 
         self.setCentralWidget(container)
@@ -415,7 +522,75 @@ class MainWindow(QMainWindow):
             self.cs_vel_current,
             self.s_max,
         )
-        self.vel_spline.setData(S_spline, vs_spline)
+
+        # Remove the existing red spline
+        self.plot.removeItem(self.spline_curve)
+
+        # Remove existing colored position segments
+        if hasattr(self, "colored_pos_segments"):
+            for segment in self.colored_pos_segments:
+                self.plot.removeItem(segment)
+
+        # Create new colored segments for position plot based on velocity
+        self.colored_pos_segments = []
+
+        if len(xs_spline) > 1 and len(vs_spline) > 1:
+            # Create a PyQtGraph ColorMap (green-yellow-red)
+            pos = np.array([0.0, 0.5, 1.0])
+            colors = np.array(
+                [
+                    [0, 200, 0, 255],  # Green (low speed)
+                    [255, 255, 0, 255],  # Yellow (medium speed)
+                    [255, 0, 0, 255],  # Red (high speed)
+                ]
+            )
+            cmap = pg.ColorMap(pos, colors)
+
+            # Add MultiColorLine for position plot
+            multi_color_line = MultiColorLine(
+                xs_spline, ys_spline, vs_spline, cmap, width=6
+            )
+            self.plot.addItem(multi_color_line)
+            self.colored_pos_segments.append(multi_color_line)
+        else:
+            # If no data, add back the simple red spline
+            self.plot.addItem(self.spline_curve)
+            self.spline_curve.setData(xs_spline, ys_spline)
+
+        # Create colored velocity plot
+        if len(S_spline) > 1 and len(vs_spline) > 1:
+            # Remove existing velocity spline
+            if hasattr(self, "vel_spline"):
+                self.vel_plot.removeItem(self.vel_spline)
+
+            # Remove existing colored segments
+            if hasattr(self, "colored_vel_segments"):
+                for segment in self.colored_vel_segments:
+                    self.vel_plot.removeItem(segment)
+
+            # Create new colored segments based on velocity
+            self.colored_vel_segments = []
+
+            # Create a PyQtGraph ColorMap (green-yellow-red)
+            pos = np.array([0.0, 0.5, 1.0])
+            colors = np.array(
+                [
+                    [0, 200, 0, 255],  # Green (low speed)
+                    [255, 255, 0, 255],  # Yellow (medium speed)
+                    [255, 0, 0, 255],  # Red (high speed)
+                ]
+            )
+            cmap = pg.ColorMap(pos, colors)
+
+            # Add MultiColorLine for velocity plot
+            multi_color_line = MultiColorLine(
+                S_spline, vs_spline, vs_spline, cmap, width=4
+            )
+            self.vel_plot.addItem(multi_color_line)
+            self.colored_vel_segments.append(multi_color_line)
+        else:
+            # If no data, just update the red line
+            self.vel_spline.setData(S_spline, vs_spline)
 
     def on_slider_change(self, value):
         self.num_samples = value
@@ -537,8 +712,73 @@ class MainWindow(QMainWindow):
             self.cs_vel_current,
             self.s_max,
         )
-        self.spline_curve.setData(xs, ys)
-        self.vel_spline.setData(S, vs)
+
+        # Remove the existing simple red spline
+        self.plot.removeItem(self.spline_curve)
+
+        # Remove existing colored position segments
+        if hasattr(self, "colored_pos_segments"):
+            for segment in self.colored_pos_segments:
+                self.plot.removeItem(segment)
+
+        # Create new colored segments for position plot based on velocity
+        self.colored_pos_segments = []
+
+        if len(xs) > 1 and len(vs) > 1:
+            # Create a PyQtGraph ColorMap (green-yellow-red)
+            pos = np.array([0.0, 0.5, 1.0])
+            colors = np.array(
+                [
+                    [0, 200, 0, 255],  # Green (low speed)
+                    [255, 255, 0, 255],  # Yellow (medium speed)
+                    [255, 0, 0, 255],  # Red (high speed)
+                ]
+            )
+            cmap = pg.ColorMap(pos, colors)
+
+            # Add MultiColorLine for position plot
+            multi_color_line = MultiColorLine(xs, ys, vs, cmap, width=6)
+            self.plot.addItem(multi_color_line)
+            self.colored_pos_segments.append(multi_color_line)
+        else:
+            # If no data, add back the simple red spline
+            self.plot.addItem(self.spline_curve)
+            self.spline_curve.setData(xs, ys)
+
+        # Create colored velocity plot
+        if len(S) > 1 and len(vs) > 1:
+            # Remove existing velocity spline
+            if hasattr(self, "vel_spline"):
+                self.vel_plot.removeItem(self.vel_spline)
+
+            # Remove existing colored segments
+            if hasattr(self, "colored_vel_segments"):
+                for segment in self.colored_vel_segments:
+                    self.vel_plot.removeItem(segment)
+
+            # Create new colored segments based on velocity
+            self.colored_vel_segments = []
+
+            # Create a PyQtGraph ColorMap (similar to viridis colormap)
+            pos = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
+            colors = np.array(
+                [
+                    [0, 0, 100, 255],  # Dark blue
+                    [0, 100, 100, 255],  # Teal blue
+                    [0, 200, 0, 255],  # Green
+                    [200, 100, 0, 255],  # Orange
+                    [255, 255, 0, 255],  # Yellow
+                ]
+            )
+            cmap = pg.ColorMap(pos, colors)
+
+            # Add MultiColorLine for velocity plot
+            multi_color_line = MultiColorLine(S, vs, vs, cmap, width=4)
+            self.vel_plot.addItem(multi_color_line)
+            self.colored_vel_segments.append(multi_color_line)
+        else:
+            # If no data, just update the red line
+            self.vel_spline.setData(S, vs)
 
         count = len(self.ctrl_pts)
         self.slider.blockSignals(True)
@@ -613,15 +853,83 @@ class MainWindow(QMainWindow):
             self.cs_vel_current = lambda x: np.full_like(x, v_new[0])
         else:
             self.cs_vel_current = lambda x: np.zeros_like(x)
-        # Update draggable velocity scatter and spline plot
+
+        # Update draggable velocity scatter
         self.draggable_vel.update_positions(s_ctrl, v_new)
+
+        # Sample the updated spline
         xs, ys, vs, S = spline_sample_closed(
             self.ctrl_pts,
             max(200, len(self.ctrl_pts) * 10),
             self.cs_vel_current,
             self.s_max,
         )
-        self.vel_spline.setData(S, vs)
+
+        # Update position plot with colored spline
+        # Remove the existing simple red spline
+        self.plot.removeItem(self.spline_curve)
+
+        # Remove existing colored position segments
+        if hasattr(self, "colored_pos_segments"):
+            for segment in self.colored_pos_segments:
+                self.plot.removeItem(segment)
+
+        # Create new colored segments for position plot based on velocity
+        self.colored_pos_segments = []
+
+        if len(xs) > 1 and len(vs) > 1:
+            # Create a PyQtGraph ColorMap (green-yellow-red)
+            pos = np.array([0.0, 0.5, 1.0])
+            colors = np.array(
+                [
+                    [0, 200, 0, 255],  # Green (low speed)
+                    [255, 255, 0, 255],  # Yellow (medium speed)
+                    [255, 0, 0, 255],  # Red (high speed)
+                ]
+            )
+            cmap = pg.ColorMap(pos, colors)
+
+            # Add MultiColorLine for position plot
+            multi_color_line = MultiColorLine(xs, ys, vs, cmap, width=6)
+            self.plot.addItem(multi_color_line)
+            self.colored_pos_segments.append(multi_color_line)
+        else:
+            # If no data, add back the simple red spline
+            self.plot.addItem(self.spline_curve)
+            self.spline_curve.setData(xs, ys)
+
+        # Update velocity plot with colored spline
+        # Remove existing velocity spline
+        if hasattr(self, "vel_spline"):
+            self.vel_plot.removeItem(self.vel_spline)
+
+        # Remove existing colored segments
+        if hasattr(self, "colored_vel_segments"):
+            for segment in self.colored_vel_segments:
+                self.vel_plot.removeItem(segment)
+
+        # Create new colored segments based on velocity
+        self.colored_vel_segments = []
+
+        if len(S) > 1 and len(vs) > 1:
+            # Create a PyQtGraph ColorMap (green-yellow-red)
+            pos = np.array([0.0, 0.5, 1.0])
+            colors = np.array(
+                [
+                    [0, 200, 0, 255],  # Green (low speed)
+                    [255, 255, 0, 255],  # Yellow (medium speed)
+                    [255, 0, 0, 255],  # Red (high speed)
+                ]
+            )
+            cmap = pg.ColorMap(pos, colors)
+
+            # Add MultiColorLine for velocity plot
+            multi_color_line = MultiColorLine(S, vs, vs, cmap, width=4)
+            self.vel_plot.addItem(multi_color_line)
+            self.colored_vel_segments.append(multi_color_line)
+        else:
+            # If no data, just update the red line
+            self.vel_spline.setData(S, vs)
 
 
 if __name__ == "__main__":
