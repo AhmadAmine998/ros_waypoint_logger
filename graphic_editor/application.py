@@ -934,7 +934,13 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    w = MainWindow()
+
+    # Get CSV path from command line argument if provided
+    csv_path = "../traj_examples/new_loc.csv"  # Default path
+    if len(sys.argv) > 1:
+        csv_path = sys.argv[1]
+
+    w = MainWindow(csv_path)
     w.resize(1000, 600)
     w.show()
     sys.exit(app.exec())
