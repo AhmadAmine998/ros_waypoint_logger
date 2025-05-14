@@ -96,8 +96,8 @@ class DraggableScatter(pg.ScatterPlotItem):
         super().__init__(
             pos=positions,
             data=list(range(len(positions))),
-            pen=pg.mkPen("b"),
-            brush=pg.mkBrush("b"),
+            pen=pg.mkPen("r"),
+            brush=pg.mkBrush("r"),
             size=12,
         )
         self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
@@ -266,11 +266,11 @@ class MainWindow(QMainWindow):
 
     def save_csv(self):
         # Generate a new filename by appending '_modified' to the original filename
-        new_csv_path = self.csv_path.replace('.csv', '_modified.csv')
+        new_csv_path = self.csv_path.replace(".csv", "_modified.csv")
 
         # sample the current spline before saving
         xs, ys, vs, S = spline_sample_closed(
-            self.ctrl_pts, self.num_samples, self.cs_vel, self.s_max
+            self.ctrl_pts, 1000, self.cs_vel, self.s_max
         )
         # compute heading psi
         x_np = xs
