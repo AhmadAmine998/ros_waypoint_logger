@@ -10,3 +10,7 @@ dependencies = [
     "pyqtgraph>=0.13.7",
     "scipy>=1.15.3",
 ]
+authors = [
+    { name = "Nandan Tumu", email = "nandan@nandantumu.com" },
+    { name = "Ahmad Amine", email = "aminea@seas.upenn.edu" },
+]
