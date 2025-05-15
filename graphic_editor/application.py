@@ -1,3 +1,31 @@
+"""
+Race Line Trajectory Editor
+Author: Nandan Tumu (nandan@nandantumu.com)
+License: AGPL-3.0
+
+This application provides a graphical interface for editing race line trajectories with velocity profiles.
+It allows users to:
+1. Load trajectory data from CSV files
+2. Edit the position and velocity of waypoints along a racing line
+3. Visualize the trajectory in both position (x,y) and velocity plots
+4. Save the modified trajectory to a CSV file
+
+The editor is designed for circuit/track racing applications where the path is a closed loop.
+Velocities and positions are represented as periodic cubic splines to ensure smooth transitions.
+
+Usage:
+    python application.py [path/to/trajectory.csv]
+
+The trajectory CSV should have the following columns:
+    s_m: distance along the path (meters)
+    x_m: x-coordinate (meters)
+    y_m: y-coordinate (meters)
+    vx_mps: velocity (meters per second)
+
+Additional columns like psi_rad (heading), kappa_radpm (curvature), and ax_mps2 (acceleration)
+will be computed when saving the trajectory.
+"""
+
 import sys
 import pandas as pd
 import numpy as np
@@ -123,9 +151,30 @@ class MultiColorLine(pg.GraphicsObject):
 
 def spline_sample_closed(control_pts, num_points, cs_vel, s_max):
     """
-    Sample a closed-loop periodic spline for position (x,y)
-    and velocity v as a joint multivariate periodic spline.
-    Returns arrays xs, ys, vs, and cumulative arc-length S.
+    Sample a closed-loop path with velocity profile using cubic splines.
+
+    This function creates a smooth periodic spline through the control points and
+    samples it to create a path with associated velocities. It ensures the path
+    is properly closed (the last point connects to the first) and handles edge cases.
+
+    Parameters:
+    -----------
+    control_pts : list of tuples or numpy array
+        Control points for the path as (x, y) coordinates
+    num_points : int
+        Number of points to sample along the spline
+    cs_vel : callable
+        A function that returns velocity values for given s-coordinates.
+        Typically a CubicSpline object or a lambda function.
+    s_max : float
+        Maximum s-coordinate value, used for scaling the path parameter
+
+    Returns:
+    --------
+    tuple of numpy arrays (xs, ys, vs, S)
+        xs, ys: x and y coordinates of the sampled path
+        vs: velocities at each point
+        S: cumulative arc length at each point
     """
     if not control_pts:
         return np.array([]), np.array([]), np.array([]), np.array([])
@@ -228,6 +277,24 @@ def spline_sample_closed(control_pts, num_points, cs_vel, s_max):
 
 
 def insert_nearest(control_pts, new_pt):
+    """
+    Insert a new point into the control points list at the nearest segment.
+
+    This function finds the closest line segment in the control points path
+    to the new point and inserts the new point after the start of that segment.
+
+    Parameters:
+    -----------
+    control_pts : list of tuples
+        List of (x, y) coordinates representing control points
+    new_pt : tuple
+        (x, y) coordinates of the new point to insert
+
+    Returns:
+    --------
+    list
+        A new list of control points with the new point inserted
+    """
     pts = np.array(control_pts)
     x0, y0 = new_pt
     min_dist = float("inf")
@@ -252,7 +319,28 @@ def insert_nearest(control_pts, new_pt):
 
 
 class DraggableScatter(pg.ScatterPlotItem):
+    """
+    Interactive scatter plot for dragging, adding, and removing control points.
+
+    This class allows users to manipulate control points by:
+    - Dragging points to new positions
+    - Double-clicking on empty space to add a new point
+    - Double-clicking on an existing point to remove it
+
+    Changes to the control points automatically update the spline representation.
+    """
+
     def __init__(self, positions, update_callback):
+        """
+        Initialize the draggable scatter plot.
+
+        Parameters:
+        -----------
+        positions : list of tuples
+            List of (x, y) coordinates for the initial scatter points
+        update_callback : callable
+            Function to call when points are modified, with positions as argument
+        """
         super().__init__(
             pos=positions,
             data=list(range(len(positions))),
@@ -306,7 +394,33 @@ class DraggableScatter(pg.ScatterPlotItem):
 
 
 class DraggableVelocityScatter(pg.ScatterPlotItem):
+    """
+    Interactive scatter plot for manipulating velocity control points.
+
+    This class allows users to drag velocity control points vertically to adjust
+    velocity values at specific points along the path. It maintains the relationship
+    between path distance (s-coordinate) and velocity, ensuring that:
+    - Velocity values remain non-negative
+    - Periodic boundary conditions are maintained when specified
+
+    Changes to velocity points automatically update the spline representation.
+    """
+
     def __init__(self, s_coords, v_coords, update_callback, is_periodic=True):
+        """
+        Initialize the draggable velocity scatter plot.
+
+        Parameters:
+        -----------
+        s_coords : array-like
+            Array of s-coordinates (distance along path) for the velocity control points
+        v_coords : array-like
+            Array of velocity values corresponding to the s-coordinates
+        update_callback : callable
+            Function to call when velocities are modified
+        is_periodic : bool, optional
+            Whether to enforce periodic boundary conditions (default: True)
+        """
         self.s_coords = np.array(s_coords)
         self.v_coords = np.array(v_coords)
         self.update_callback = update_callback
@@ -492,6 +606,22 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(container)
 
     def _get_arc_lengths_for_path_ctrl_pts(self, path_ctrl_pts):
+        """
+        Calculate arc lengths (s-coordinates) for control points along a path.
+
+        This method computes the cumulative distance along the path for each control point,
+        which is used to map between spatial position and path parameter.
+
+        Parameters:
+        -----------
+        path_ctrl_pts : list of tuples
+            List of (x, y) coordinates for the control points
+
+        Returns:
+        --------
+        numpy.ndarray
+            Array of s-coordinates (distances) for each control point
+        """
         if not path_ctrl_pts:
             return np.array([])
         pts = np.array(path_ctrl_pts)
@@ -505,6 +635,20 @@ class MainWindow(QMainWindow):
         return s_coords
 
     def handle_velocity_drag(self, s_coords, v_coords):
+        """
+        Update the velocity profile when velocity control points are dragged.
+
+        This method is called when the user drags velocity control points in the velocity plot.
+        It updates the cubic spline representing the velocity profile and refreshes both
+        the position (x,y) plot and velocity plot with the new colored visualization.
+
+        Parameters:
+        -----------
+        s_coords : array-like
+            Array of s-coordinates (distance along path) for each velocity control point
+        v_coords : array-like
+            Array of velocity values corresponding to each s-coordinate
+        """
         if len(s_coords) > 1:
             v_coords_periodic = np.array(v_coords)
             v_coords_periodic[-1] = v_coords_periodic[0]
@@ -593,6 +737,18 @@ class MainWindow(QMainWindow):
             self.vel_spline.setData(S_spline, vs_spline)
 
     def on_slider_change(self, value):
+        """
+        Update the number of control points when the slider value changes.
+
+        This method resamples the original static path with a new number of points
+        based on the slider value, creating a new set of control points and
+        updating the spline visualization.
+
+        Parameters:
+        -----------
+        value : int
+            New number of control points from the slider
+        """
         self.num_samples = value
         xs, ys, vs, S = spline_sample_closed(
             self.static_pts, self.num_samples, self.cs_vel_initial, self.s_max
@@ -603,6 +759,19 @@ class MainWindow(QMainWindow):
         self.update_spline(self.ctrl_pts)
 
     def update_spline(self, ctrl_pts):
+        """
+        Update the spline representation when control points are modified.
+
+        This method is called whenever control points are moved, added, or removed.
+        It updates both the position spline and the velocity profile, maintaining
+        consistency between them. It also handles the colored visualization of the
+        splines based on velocity values.
+
+        Parameters:
+        -----------
+        ctrl_pts : list of tuples
+            List of (x, y) coordinates for the updated control points
+        """
         self.ctrl_pts = ctrl_pts
         s_ctrl_path_current = self._get_arc_lengths_for_path_ctrl_pts(self.ctrl_pts)
         if len(s_ctrl_path_current) > 0:
@@ -787,6 +956,20 @@ class MainWindow(QMainWindow):
         self.slider_label.setText(f"Points: {count}")
 
     def save_csv(self):
+        """
+        Save the modified trajectory to a CSV file.
+
+        This method samples the current spline at a high resolution (1000 points)
+        and computes all necessary trajectory parameters including:
+        - Position (x, y)
+        - Path length (s)
+        - Heading angle (psi)
+        - Curvature (kappa)
+        - Velocity (vx)
+        - Acceleration (ax)
+
+        The trajectory is saved to a new file with "_modified" appended to the original filename.
+        """
         new_csv_path = self.csv_path.replace(".csv", "_modified.csv")
 
         xs, ys, vs, S = spline_sample_closed(
@@ -835,7 +1018,17 @@ class MainWindow(QMainWindow):
         print(f"Saved {len(df_out)} interpolated points to {new_csv_path}")
 
     def reset_velocity_profile(self):
-        """Reset velocity control points to velocities of closest original XY waypoints."""
+        """
+        Reset velocity control points to velocities of closest original XY waypoints.
+
+        This method restores the velocity profile to match the original waypoints' velocities.
+        For each control point in the current path, it:
+        1. Finds the closest waypoint in the original (static) path
+        2. Assigns the velocity from that original waypoint
+        3. Updates the velocity spline and visualizations
+
+        This is useful for reverting velocity changes while maintaining the current path shape.
+        """
         s_ctrl = self._get_arc_lengths_for_path_ctrl_pts(self.ctrl_pts)
         # Find closest static waypoint for each control point
         static_arr = np.array(self.static_pts)
