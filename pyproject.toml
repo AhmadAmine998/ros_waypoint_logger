@@ -1,0 +1,22 @@
+[project]
+name = "ros-waypoint-logger"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pandas>=2.2.3",
+    "pyqt6>=6.9.0",
+    "pyqtgraph>=0.13.7",
+    "scipy>=1.15.3",
+]
+authors = [
+    { name = "Nandan Tumu", email = "nandan@nandantumu.com" },
+    { name = "Ahmad Amine", email = "aminea@seas.upenn.edu" },
+]
+
+[project.scripts]
+ros-waypoint-editor = "graphic_editor.application"
+
+[tool.setuptools]
+packages = ["graphic_editor"]
