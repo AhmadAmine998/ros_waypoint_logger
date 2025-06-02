@@ -35,7 +35,6 @@ class TrajectoryLogger(Node):
         self.declare_parameter("min_ds", 0.1)
         min_ds = self.get_parameter("min_ds").get_parameter_value().double_value
         self.get_logger().info(f"Using minimum between points: {min_ds} m")
-        # self.get_logger().info(f"Using vehicle state topic: {"/ground_truth/combined"}")
 
         self.prev_time = self.get_clock().now().seconds_nanoseconds()
         self.prev_time = self.prev_time[0] + self.prev_time[1] * 1e-9
@@ -44,8 +43,14 @@ class TrajectoryLogger(Node):
         self.timestamps = []
         self.xs = []
         self.ys = []
+        self.zs = []
         self.vxs = []
+        self.vys = []
+        self.vzs = []
         self.axs = []
+        self.omega_xs = []
+        self.omega_ys = []
+        self.omega_zs = []
         self.min_num_points = 100
         self.loop_back_threshold = 0.2
 
@@ -63,6 +68,7 @@ class TrajectoryLogger(Node):
         # [X, Y, V, YAW, YAW_RATE, SLIP_ANGLE]
         x = msg.state.x
         y = msg.state.y
+        z = msg.state.z
 
         if self.xs and self.ys:
             prev_x = self.xs[-1]
@@ -85,6 +91,12 @@ class TrajectoryLogger(Node):
             raise KeyboardInterrupt  # Hacky way to stop the node, but it works
 
         vx = msg.state.velocity * np.cos(msg.state.slip_angle)
+        vy = msg.state.velocity * np.sin(msg.state.slip_angle)
+        vz = msg.state.velocity_z
+
+        omega_x = msg.state.roll_rate
+        omega_y = msg.state.pitch_rate
+        omega_z = msg.state.yaw_rate
 
         now = self.get_clock().now().seconds_nanoseconds()
         now = now[0] + now[1] * 1e-9
@@ -93,6 +105,8 @@ class TrajectoryLogger(Node):
         self.xs.append(x)
         self.ys.append(y)
         self.vxs.append(vx)
+        self.vys.append(vy)
+        self.vzs.append(vz)
         self.axs.append(
             (vx - self.prev_vx) / (now - self.prev_time)
             if self.prev_vx is not None
@@ -115,15 +129,22 @@ class TrajectoryLogger(Node):
         try:
             x_np = np.array(self.xs)
             y_np = np.array(self.ys)
+            z_np = np.array(self.zs)
             vx_np = np.array(self.vxs)
             ax_np = np.array(self.axs)
 
             dx = np.gradient(x_np, edge_order=2)
             dy = np.gradient(y_np, edge_order=2)
+            dz = np.gradient(z_np, edge_order=2)
             s_np = np.sqrt(dx**2 + dy**2).cumsum()
 
             # Calculate heading
             psi_np = np.arctan2(dy, dx)
+
+            # Calculate pitch
+            theta_np = np.arctan2(dz, dx)
+            # Calculate roll
+            phi_np = np.arctan2(dz, dy)            
 
             # Calculate curvature
             # For more stable gradients, extend x and y by two (edge_order 2) elements on each side
@@ -151,6 +172,11 @@ class TrajectoryLogger(Node):
                     "kappa_radpm": kappa_np[2:-2],
                     "vx_mps": vx_np,
                     "ax_mps2": ax_np,
+                    "z_m": z_np,
+                    "theta_rad": theta_np,
+                    "phi_rad": phi_np,
+                    "vy_mps": self.vys,
+                    "vz_mps": self.vzs,
                 }
             )
 
