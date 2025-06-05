@@ -40,9 +40,12 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSlider,
     QLabel,
+    QLineEdit,
+    QFormLayout,
+    QGroupBox,
 )
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QPointF
+from PyQt6.QtCore import Qt, QPointF, pyqtSlot, pyqtSignal
 from PyQt6.QtGui import QPainterPath
 
 from waypoints_loader import load_waypoints
@@ -149,13 +152,84 @@ class MultiColorLine(pg.GraphicsObject):
         self.update()
 
 
-def spline_sample_closed(control_pts, num_points, cs_vel, s_max):
+# Helper functions for spline_sample_closed
+def _spline_helpers_close_arrays(*arrays):
+    """Appends the first element of each array to its end."""
+    return tuple(np.concatenate([arr, arr[:1]]) for arr in arrays)
+
+
+def _spline_helpers_get_constant_outputs(
+    pt_x, pt_y, num_points, cs_vel, cs_z, cs_roll, cs_pitch, cs_yaw
+):
+    """Generates all output arrays for a constant path (single or co-located points)."""
+    xs_sample = np.full(num_points, pt_x)
+    ys_sample = np.full(num_points, pt_y)
+    try:
+        v_val = cs_vel(0.0)
+    except Exception:
+        v_val = 0.0
+    vs_sample = np.full(num_points, np.maximum(0, v_val))
+    S_sample = np.zeros(num_points)
+
+    z_val = cs_z(0.0) if cs_z else 0.0
+    roll_val = cs_roll(0.0) if cs_roll else 0.0
+    pitch_val = cs_pitch(0.0) if cs_pitch else 0.0
+    yaw_val = cs_yaw(0.0) if cs_yaw else 0.0
+
+    zs_sample = np.full(num_points, z_val)
+    rolls_sample = np.full(num_points, roll_val)
+    pitchs_sample = np.full(num_points, pitch_val)
+    yaws_sample = np.full(num_points, yaw_val)
+
+    xs, ys, zs, vs, S, rolls, pitchs, yaws = _spline_helpers_close_arrays(
+        xs_sample,
+        ys_sample,
+        zs_sample,
+        vs_sample,
+        S_sample,
+        rolls_sample,
+        pitchs_sample,
+        yaws_sample,
+    )
+    # Ensure S is correctly closed for a single point (0 at start and end)
+    if S.size > 0:
+        S[-1] = 0.0  # S should be [0,0,...,0] then closed to [0,0,...,0,0]
+    return xs, ys, zs, vs, S, rolls, pitchs, yaws
+
+
+def _spline_helpers_get_periodic_ctrl_values(
+    cs_optional, s_ctrl_path, default_value=0.0
+):
+    """Gets values from an optional spline or returns defaults, ensuring periodicity."""
+    if cs_optional:
+        values = cs_optional(s_ctrl_path)
+    else:
+        values = np.full_like(s_ctrl_path, default_value)
+
+    if len(values) > 0:  # Ensure periodicity
+        values_periodic = np.array(values)  # Make a copy
+        values_periodic[-1] = values_periodic[0]
+        return values_periodic
+    return values
+
+
+def spline_sample_closed(
+    control_pts,
+    num_points,
+    cs_vel,
+    s_max,
+    cs_z=None,
+    cs_roll=None,
+    cs_pitch=None,
+    cs_yaw=None,
+):
     """
     Sample a closed-loop path with velocity profile using cubic splines.
 
     This function creates a smooth periodic spline through the control points and
     samples it to create a path with associated velocities. It ensures the path
     is properly closed (the last point connects to the first) and handles edge cases.
+    It now also handles optional z, roll, pitch, and yaw splines.
 
     Parameters:
     -----------
@@ -168,36 +242,40 @@ def spline_sample_closed(control_pts, num_points, cs_vel, s_max):
         Typically a CubicSpline object or a lambda function.
     s_max : float
         Maximum s-coordinate value, used for scaling the path parameter
+    cs_z : callable, optional
+        CubicSpline for z-coordinate.
+    cs_roll : callable, optional
+        CubicSpline for roll angle.
+    cs_pitch : callable, optional
+        CubicSpline for pitch angle.
+    cs_yaw : callable, optional
+        CubicSpline for yaw angle.
 
     Returns:
     --------
-    tuple of numpy arrays (xs, ys, vs, S)
-        xs, ys: x and y coordinates of the sampled path
+    tuple of numpy arrays (xs, ys, zs, vs, S, rolls, pitchs, yaws)
+        xs, ys, zs: x, y, and z coordinates of the sampled path
         vs: velocities at each point
         S: cumulative arc length at each point
+        rolls, pitchs, yaws: roll, pitch, and yaw angles at each point
     """
     if not control_pts:
-        return np.array([]), np.array([]), np.array([]), np.array([])
+        empty_arr = np.array([])
+        return tuple(empty_arr for _ in range(8))
 
     pts_arr = np.array(control_pts)
 
     if pts_arr.shape[0] == 1:
-        xs_sample = np.full(num_points, pts_arr[0, 0])
-        ys_sample = np.full(num_points, pts_arr[0, 1])
-        try:
-            v_val = cs_vel(0.0)  # Velocity at s=0 for a single point path
-        except Exception:
-            v_val = 0.0  # Default if cs_vel fails (e.g. spline needs wider domain)
-        vs_sample = np.full(
-            num_points, np.maximum(0, v_val)
-        )  # Clamp this single velocity value
-        S_sample = np.zeros(num_points)
-        # Close loop for output format consistency
-        xs = np.concatenate([xs_sample, xs_sample[:1]])
-        ys = np.concatenate([ys_sample, ys_sample[:1]])
-        vs = np.concatenate([vs_sample, vs_sample[:1]])
-        S = np.concatenate([S_sample, S_sample[:1]])  # S[-1] will be 0
-        return xs, ys, vs, S
+        return _spline_helpers_get_constant_outputs(
+            pts_arr[0, 0],
+            pts_arr[0, 1],
+            num_points,
+            cs_vel,
+            cs_z,
+            cs_roll,
+            cs_pitch,
+            cs_yaw,
+        )
 
     # Prepare path points for spline (ensure closure: pts_for_spline[0] == pts_for_spline[-1])
     pts_for_spline = np.array(pts_arr)
@@ -214,66 +292,78 @@ def spline_sample_closed(control_pts, num_points, cs_vel, s_max):
     if (
         total_path_length < 1e-9
     ):  # All points in pts_for_spline are effectively identical
-        xs_sample = np.full(num_points, pts_for_spline[0, 0])
-        ys_sample = np.full(num_points, pts_for_spline[0, 1])
-        try:
-            v_val = cs_vel(0.0)
-        except Exception:
-            v_val = 0.0
-        vs_sample = np.full(num_points, np.maximum(0, v_val))
-        S_sample = np.zeros(num_points)
-        xs = np.concatenate([xs_sample, xs_sample[:1]])
-        ys = np.concatenate([ys_sample, ys_sample[:1]])
-        vs = np.concatenate([vs_sample, vs_sample[:1]])
-        S = np.concatenate([S_sample, S_sample[:1]])
-        return xs, ys, vs, S
+        return _spline_helpers_get_constant_outputs(
+            pts_for_spline[0, 0],
+            pts_for_spline[0, 1],
+            num_points,
+            cs_vel,
+            cs_z,
+            cs_roll,
+            cs_pitch,
+            cs_yaw,
+        )
 
-    t_norm_path = (
-        t_path / total_path_length
-    )  # Normalized parameter [0,1] for pts_for_spline
+    t_norm_path = t_path / total_path_length  # Normalized parameter [0,1]
 
-    # Compute velocities at each point in pts_for_spline using cs_vel
-    # s_ctrl_path are s-values corresponding to t_norm_path, scaled by overall s_max from CSV
+    # Compute velocities at control points
     s_ctrl_path = t_norm_path * s_max
-    v_values_at_s_ctrl = cs_vel(s_ctrl_path)
-
-    # Clamp these velocities to be non-negative to prevent spline undershoot into negative territory
-    v_clamped_at_s_ctrl = np.maximum(0, v_values_at_s_ctrl)
-
-    # Ensure periodicity for the clamped velocity values (v[0] == v[-1])
-    v_final_for_y_ctrl = np.array(v_clamped_at_s_ctrl)  # Make a copy
+    v_values_at_s_ctrl = np.maximum(0, cs_vel(s_ctrl_path))  # Clamp raw velocities
+    v_final_for_y_ctrl = np.array(v_values_at_s_ctrl)
     if len(v_final_for_y_ctrl) > 0:
-        v_final_for_y_ctrl[-1] = v_final_for_y_ctrl[0]
+        v_final_for_y_ctrl[-1] = v_final_for_y_ctrl[0]  # Ensure periodicity
 
-    # Build joint periodic spline [x, y, v]
-    # y_ctrl uses pts_for_spline (which has x[0]==x[-1], y[0]==y[-1])
-    # and v_final_for_y_ctrl (which has v[0]==v[-1])
+    # Get Z, Roll, Pitch, Yaw values at control points, ensuring periodicity
+    z_final_for_y_ctrl = _spline_helpers_get_periodic_ctrl_values(cs_z, s_ctrl_path)
+    roll_final_for_y_ctrl = _spline_helpers_get_periodic_ctrl_values(
+        cs_roll, s_ctrl_path
+    )
+    pitch_final_for_y_ctrl = _spline_helpers_get_periodic_ctrl_values(
+        cs_pitch, s_ctrl_path
+    )
+    yaw_final_for_y_ctrl = _spline_helpers_get_periodic_ctrl_values(cs_yaw, s_ctrl_path)
+
+    # Build joint periodic spline [x, y, v, z, roll, pitch, yaw]
     y_ctrl = np.column_stack(
-        (pts_for_spline[:, 0], pts_for_spline[:, 1], v_final_for_y_ctrl)
+        (
+            pts_for_spline[:, 0],
+            pts_for_spline[:, 1],
+            v_final_for_y_ctrl,
+            z_final_for_y_ctrl,
+            roll_final_for_y_ctrl,
+            pitch_final_for_y_ctrl,
+            yaw_final_for_y_ctrl,
+        )
     )
     cs_all = CubicSpline(t_norm_path, y_ctrl, bc_type="periodic", axis=0)
 
-    # Sample the joint spline uniformly over one period [0,1)
+    # Sample the joint spline
     ts_sample = np.linspace(0, 1, num_points, endpoint=False)
     sampled_points = cs_all(ts_sample)
 
     xs_period = sampled_points[:, 0]
     ys_period = sampled_points[:, 1]
-    vs_period = sampled_points[:, 2]
+    vs_period = np.maximum(0, sampled_points[:, 2])  # Ensure non-negative velocities
+    zs_period = sampled_points[:, 3]
+    rolls_period = sampled_points[:, 4]
+    pitchs_period = sampled_points[:, 5]
+    yaws_period = sampled_points[:, 6]
 
-    # Ensure final sampled velocities are non-negative
-    vs_period = np.maximum(0, vs_period)
+    # Close the loop for output arrays
+    xs, ys, zs, vs, rolls, pitchs, yaws = _spline_helpers_close_arrays(
+        xs_period,
+        ys_period,
+        zs_period,
+        vs_period,
+        rolls_period,
+        pitchs_period,
+        yaws_period,
+    )
 
-    # Close the loop for the final output arrays by appending the first sample
-    xs = np.concatenate([xs_period, xs_period[:1]])
-    ys = np.concatenate([ys_period, ys_period[:1]])
-    vs = np.concatenate([vs_period, vs_period[:1]])
-
-    # Compute cumulative arc-length S for the *final sampled* path
+    # Compute cumulative arc-length S for the final sampled path
     ds_final = np.hypot(np.diff(xs), np.diff(ys))
     S = np.concatenate(([0], np.cumsum(ds_final)))
 
-    return xs, ys, vs, S
+    return xs, ys, zs, vs, S, rolls, pitchs, yaws
 
 
 def insert_nearest(control_pts, new_pt):
@@ -330,7 +420,9 @@ class DraggableScatter(pg.ScatterPlotItem):
     Changes to the control points automatically update the spline representation.
     """
 
-    def __init__(self, positions, update_callback):
+    point_selected_signal = pyqtSignal(int)
+
+    def __init__(self, positions, update_callback, on_select_callback=None):
         """
         Initialize the draggable scatter plot.
 
@@ -351,16 +443,26 @@ class DraggableScatter(pg.ScatterPlotItem):
         self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
         self.positions = list(positions)
         self.update_callback = update_callback
+        self.on_select_callback = on_select_callback
         self.dragIndex = None
+        self.selectedIndex = None
 
     def mousePressEvent(self, ev):
-        view_pt = self.getViewBox().mapSceneToView(ev.scenePos())
-        pts = self.pointsAt(view_pt)
-        if len(pts) > 0 and ev.button() == Qt.MouseButton.LeftButton:
-            self.dragIndex = pts[0].data()
-            ev.accept()
-        else:
-            ev.ignore()
+        if ev.button() == Qt.MouseButton.LeftButton:
+            view_pt = self.getViewBox().mapSceneToView(ev.scenePos())
+            pts = self.pointsAt(view_pt)
+            if len(pts) > 0:
+                self.dragIndex = pts[0].data()
+                self.selectedIndex = self.dragIndex
+                # The selection notification is handled by mouseClickEvent
+                ev.accept()
+                return  # Event handled, drag can start
+
+        # If not a left-button click on a point (or not left button at all)
+        self.dragIndex = (
+            None  # Critical: ensure dragIndex is None if not starting a drag
+        )
+        super().mousePressEvent(ev)  # Pass to base class
 
     def mouseMoveEvent(self, ev):
         if self.dragIndex is None or not (ev.buttons() & Qt.MouseButton.LeftButton):
@@ -392,6 +494,30 @@ class DraggableScatter(pg.ScatterPlotItem):
         self.update_callback(self.positions)
         ev.accept()
 
+    def mouseClickEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            pts = self.pointsAt(ev.pos())
+            if len(pts) > 0:
+                clicked_idx = pts[0].data()
+                self.selectedIndex = clicked_idx  # Set selectedIndex based on click
+                # self.dragIndex should not be set on a simple click
+                self.point_selected_signal.emit(self.selectedIndex)
+                if self.on_select_callback:
+                    self.on_select_callback(
+                        "position", self.selectedIndex
+                    )  # Ensure callback is called
+                ev.accept()
+            else:
+                ev.ignore()
+
+    def highlight_point(self, index):
+        self.selectedIndex = index
+        # Use 'y' (yellow) for selected, 'r' (red) for others
+        brushes = [
+            pg.mkBrush("y" if i == index else "r") for i in range(len(self.positions))
+        ]
+        self.setBrush(brushes)
+
 
 class DraggableVelocityScatter(pg.ScatterPlotItem):
     """
@@ -406,7 +532,16 @@ class DraggableVelocityScatter(pg.ScatterPlotItem):
     Changes to velocity points automatically update the spline representation.
     """
 
-    def __init__(self, s_coords, v_coords, update_callback, is_periodic=True):
+    point_selected_signal = pyqtSignal(int)
+
+    def __init__(
+        self,
+        s_coords,
+        v_coords,
+        update_callback,
+        is_periodic=True,
+        on_select_callback=None,
+    ):
         """
         Initialize the draggable velocity scatter plot.
 
@@ -425,6 +560,7 @@ class DraggableVelocityScatter(pg.ScatterPlotItem):
         self.v_coords = np.array(v_coords)
         self.update_callback = update_callback
         self.is_periodic = is_periodic
+        self.on_select_callback = on_select_callback
         super().__init__(
             x=self.s_coords,
             y=self.v_coords,
@@ -435,6 +571,7 @@ class DraggableVelocityScatter(pg.ScatterPlotItem):
         )
         self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
         self.dragIndex = None
+        self.selectedIndex = None
 
     def update_positions(self, s_coords, v_coords):
         self.s_coords = np.array(s_coords)
@@ -452,6 +589,20 @@ class DraggableVelocityScatter(pg.ScatterPlotItem):
         pts = self.pointsAt(view_pt)
         if len(pts) > 0 and ev.button() == Qt.MouseButton.LeftButton:
             self.dragIndex = pts[0].data()
+            self.selectedIndex = self.dragIndex
+            # Inform parent about the selection if possible
+            # This call was causing a TypeError and selection is handled by mouseClickEvent
+            # if hasattr(self.update_callback, "__self__") and hasattr(
+            #     self.update_callback.__self__, "on_point_selected"
+            # ):
+            #     self.update_callback.__self__.on_point_selected(
+            #         "velocity",
+            #         self.selectedIndex,
+            #         (
+            #             self.s_coords[self.selectedIndex],
+            #             self.v_coords[self.selectedIndex],
+            #         ),
+            #     )
             ev.accept()
         else:
             ev.ignore()
@@ -470,7 +621,9 @@ class DraggableVelocityScatter(pg.ScatterPlotItem):
             if self.dragIndex == 0:
                 self.v_coords[-1] = self.v_coords[0]
             elif self.dragIndex == len(self.v_coords) - 1:
-                self.v_coords[0] = self.v_coords[-1]
+                self.v_coords[0] = self.v_coords[
+                    -1
+                ]  # Ensure periodicity when dragging end points
 
         self.setData(
             x=self.s_coords, y=self.v_coords, data=list(range(len(self.s_coords)))
@@ -482,6 +635,27 @@ class DraggableVelocityScatter(pg.ScatterPlotItem):
         self.dragIndex = None
         ev.accept()
 
+    def mouseClickEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            pts = self.pointsAt(ev.pos())
+            if len(pts) > 0:
+                clicked_idx = pts[0].data()
+                self.selectedIndex = clicked_idx
+                self.point_selected_signal.emit(self.selectedIndex)
+                if self.on_select_callback:
+                    self.on_select_callback("velocity", self.selectedIndex)
+                ev.accept()
+            else:
+                ev.ignore()
+
+    def highlight_point(self, index):
+        self.selectedIndex = index
+        # Use 'y' (yellow) for selected, 'g' (green) for others
+        brushes = [
+            pg.mkBrush("y" if i == index else "g") for i in range(len(self.s_coords))
+        ]
+        self.setBrush(brushes)
+
 
 class MainWindow(QMainWindow):
     def __init__(self, csv_path="../traj_examples/new_loc.csv"):
@@ -490,10 +664,36 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Race Line Editor: Circuit Mode")
         self.num_samples = 30
 
+        # Initialize editor state variables
+        self.current_edit_type = None
+        self.current_edit_index = None
+
         df = load_waypoints(self.csv_path)
         self.static_pts = list(df[["x_m", "y_m"]].itertuples(index=False, name=None))
         if not self.static_pts:
             self.static_pts = [(0, 0), (1, 1), (2, 0), (3, 1)]
+
+        # Load Z, Roll, Pitch, Yaw if available
+        self.z_orig = (
+            df["z_m"].to_numpy()
+            if "z_m" in df.columns
+            else np.zeros(len(self.static_pts))
+        )
+        self.roll_orig = (
+            df["roll_rad"].to_numpy()
+            if "roll_rad" in df.columns
+            else np.zeros(len(self.static_pts))
+        )
+        self.pitch_orig = (
+            df["pitch_rad"].to_numpy()
+            if "pitch_rad" in df.columns
+            else np.zeros(len(self.static_pts))
+        )
+        self.yaw_orig = (
+            df["yaw_rad"].to_numpy()
+            if "yaw_rad" in df.columns
+            else np.zeros(len(self.static_pts))
+        )
 
         s_orig = df["s_m"].to_numpy()
         v_orig = df["vx_mps"].to_numpy()
@@ -501,9 +701,22 @@ class MainWindow(QMainWindow):
 
         # Prepare v_orig for CubicSpline with periodic boundary conditions
         v_for_spline = np.copy(v_orig)
+        z_for_spline = np.copy(self.z_orig)
+        roll_for_spline = np.copy(self.roll_orig)
+        pitch_for_spline = np.copy(self.pitch_orig)
+        yaw_for_spline = np.copy(self.yaw_orig)
+
         if len(s_orig) > 1:  # This implies bc_type will be 'periodic'
             if not np.isclose(v_for_spline[0], v_for_spline[-1]):
                 v_for_spline[-1] = v_for_spline[0]  # Enforce periodicity for the spline
+            if not np.isclose(z_for_spline[0], z_for_spline[-1]):
+                z_for_spline[-1] = z_for_spline[0]
+            if not np.isclose(roll_for_spline[0], roll_for_spline[-1]):
+                roll_for_spline[-1] = roll_for_spline[0]
+            if not np.isclose(pitch_for_spline[0], pitch_for_spline[-1]):
+                pitch_for_spline[-1] = pitch_for_spline[0]
+            if not np.isclose(yaw_for_spline[0], yaw_for_spline[-1]):
+                yaw_for_spline[-1] = yaw_for_spline[0]
 
         # cs_vel_initial is based on the original CSV, used for resetting or reference
         self.cs_vel_initial = CubicSpline(
@@ -511,6 +724,28 @@ class MainWindow(QMainWindow):
             v_for_spline,
             bc_type="periodic" if len(s_orig) > 1 else "not-a-knot",
         )
+        # Create initial splines for Z, Roll, Pitch, Yaw
+        self.cs_z_initial = CubicSpline(
+            s_orig,
+            z_for_spline,
+            bc_type="periodic" if len(s_orig) > 1 else "not-a-knot",
+        )
+        self.cs_roll_initial = CubicSpline(
+            s_orig,
+            roll_for_spline,
+            bc_type="periodic" if len(s_orig) > 1 else "not-a-knot",
+        )
+        self.cs_pitch_initial = CubicSpline(
+            s_orig,
+            pitch_for_spline,
+            bc_type="periodic" if len(s_orig) > 1 else "not-a-knot",
+        )
+        self.cs_yaw_initial = CubicSpline(
+            s_orig,
+            yaw_for_spline,
+            bc_type="periodic" if len(s_orig) > 1 else "not-a-knot",
+        )
+
         self.s_max = s_orig[-1]
 
         container = QWidget()
@@ -524,6 +759,56 @@ class MainWindow(QMainWindow):
         reset_btn = QPushButton("Reset Velocities")
         reset_btn.clicked.connect(self.reset_velocity_profile)
         ctrl_layout.addWidget(reset_btn)
+
+        # Add text fields for point editing
+        edit_group = QGroupBox("Point Editor")
+        edit_form = QFormLayout()
+
+        self.point_index_label = QLabel("No point selected")
+        edit_form.addRow("Selected:", self.point_index_label)
+
+        self.x_edit = QLineEdit()
+        self.x_edit.setPlaceholderText("X")
+        self.x_edit.returnPressed.connect(self.apply_point_edit)
+        edit_form.addRow("X:", self.x_edit)
+
+        self.y_edit = QLineEdit()
+        self.y_edit.setPlaceholderText("Y")
+        self.y_edit.returnPressed.connect(self.apply_point_edit)
+        edit_form.addRow("Y:", self.y_edit)
+
+        self.z_edit = QLineEdit()
+        self.z_edit.setPlaceholderText("Z")
+        self.z_edit.returnPressed.connect(self.apply_point_edit)
+        edit_form.addRow("Z:", self.z_edit)
+
+        self.v_edit = QLineEdit()
+        self.v_edit.setPlaceholderText("Velocity")
+        self.v_edit.returnPressed.connect(self.apply_point_edit)
+        edit_form.addRow("V:", self.v_edit)
+
+        self.roll_edit = QLineEdit()
+        self.roll_edit.setPlaceholderText("Roll (rad)")
+        self.roll_edit.returnPressed.connect(self.apply_point_edit)
+        edit_form.addRow("Roll:", self.roll_edit)
+
+        self.pitch_edit = QLineEdit()
+        self.pitch_edit.setPlaceholderText("Pitch (rad)")
+        self.pitch_edit.returnPressed.connect(self.apply_point_edit)
+        edit_form.addRow("Pitch:", self.pitch_edit)
+
+        self.yaw_edit = QLineEdit()
+        self.yaw_edit.setPlaceholderText("Yaw (rad)")
+        self.yaw_edit.returnPressed.connect(self.apply_point_edit)
+        edit_form.addRow("Yaw:", self.yaw_edit)
+
+        apply_btn = QPushButton("Apply")
+        apply_btn.clicked.connect(self.apply_point_edit)
+        edit_form.addRow(apply_btn)
+
+        edit_group.setLayout(edit_form)
+        ctrl_layout.addWidget(edit_group)
+
         ctrl_layout.addStretch()
         main_layout.addLayout(ctrl_layout)
 
@@ -567,11 +852,27 @@ class MainWindow(QMainWindow):
         )
         self.plot.addItem(static_scatter)
 
-        xs, ys, vs, S = spline_sample_closed(
-            self.static_pts, self.num_samples, self.cs_vel_initial, self.s_max
+        xs, ys, zs, vs, S, rolls, pitchs, yaws = spline_sample_closed(
+            self.static_pts,
+            self.num_samples,
+            self.cs_vel_initial,
+            self.s_max,
+            self.cs_z_initial,
+            self.cs_roll_initial,
+            self.cs_pitch_initial,
+            self.cs_yaw_initial,
         )
-        self.ctrl_pts = list(zip(xs[:-1], ys[:-1]))
-        self.draggable = DraggableScatter(self.ctrl_pts, self.update_spline)
+        self.ctrl_pts = list(
+            zip(xs[:-1], ys[:-1])
+        )  # Store as (x,y) for now, Z is separate
+        self.ctrl_z = zs[:-1]  # Store initial z for control points
+        self.ctrl_roll = rolls[:-1]
+        self.ctrl_pitch = pitchs[:-1]
+        self.ctrl_yaw = yaws[:-1]
+
+        self.draggable = DraggableScatter(
+            self.ctrl_pts, self.update_spline, on_select_callback=self.on_point_selected
+        )
         self.plot.addItem(self.draggable)
 
         s_ctrl_path = self._get_arc_lengths_for_path_ctrl_pts(self.ctrl_pts)
@@ -581,16 +882,48 @@ class MainWindow(QMainWindow):
             self.cs_vel_current = CubicSpline(
                 s_ctrl_path, v_ctrl_path_initial, bc_type="periodic"
             )
+
+            # Ensure periodicity for z, roll, pitch, yaw for current control points
+            # This is necessary before creating their respective periodic splines.
+            # This block executes only if len(s_ctrl_path) > 1, meaning self.ctrl_z etc. also have > 1 elements.
+            self.ctrl_z[-1] = self.ctrl_z[0]
+            self.ctrl_roll[-1] = self.ctrl_roll[0]
+            self.ctrl_pitch[-1] = self.ctrl_pitch[0]
+            self.ctrl_yaw[-1] = self.ctrl_yaw[0]
+
+            # Initialize current Z, Roll, Pitch, Yaw splines based on initial control points' Z values
+            self.cs_z_current = CubicSpline(
+                s_ctrl_path, self.ctrl_z, bc_type="periodic"
+            )
+            self.cs_roll_current = CubicSpline(
+                s_ctrl_path, self.ctrl_roll, bc_type="periodic"
+            )
+            self.cs_pitch_current = CubicSpline(
+                s_ctrl_path, self.ctrl_pitch, bc_type="periodic"
+            )
+            self.cs_yaw_current = CubicSpline(
+                s_ctrl_path, self.ctrl_yaw, bc_type="periodic"
+            )
+
         elif len(s_ctrl_path) == 1:
             self.cs_vel_current = lambda x: np.full_like(x, v_ctrl_path_initial[0])
+            self.cs_z_current = lambda x: np.full_like(x, self.ctrl_z[0])
+            self.cs_roll_current = lambda x: np.full_like(x, self.ctrl_roll[0])
+            self.cs_pitch_current = lambda x: np.full_like(x, self.ctrl_pitch[0])
+            self.cs_yaw_current = lambda x: np.full_like(x, self.ctrl_yaw[0])
         else:
             self.cs_vel_current = lambda x: np.zeros_like(x)
+            self.cs_z_current = lambda x: np.zeros_like(x)
+            self.cs_roll_current = lambda x: np.zeros_like(x)
+            self.cs_pitch_current = lambda x: np.zeros_like(x)
+            self.cs_yaw_current = lambda x: np.zeros_like(x)
 
         self.draggable_vel = DraggableVelocityScatter(
             s_ctrl_path,
             v_ctrl_path_initial,
             self.handle_velocity_drag,
             is_periodic=True,
+            on_select_callback=self.on_point_selected,
         )
         self.vel_plot.addItem(self.draggable_vel)
 
@@ -630,8 +963,8 @@ class MainWindow(QMainWindow):
         closed_pts = np.vstack([pts, pts[0]])
         dx = np.diff(closed_pts[:, 0])
         dy = np.diff(closed_pts[:, 1])
-        dist = np.hypot(dx, dy)
-        s_coords = np.concatenate(([0], np.cumsum(dist[:-1])))
+        self.dist = np.hypot(dx, dy)
+        s_coords = np.concatenate(([0], np.cumsum(self.dist[:-1])))
         return s_coords
 
     def handle_velocity_drag(self, s_coords, v_coords):
@@ -660,11 +993,24 @@ class MainWindow(QMainWindow):
         else:
             self.cs_vel_current = lambda x: np.zeros_like(x)
 
-        xs_spline, ys_spline, vs_spline, S_spline = spline_sample_closed(
+        (
+            xs_spline,
+            ys_spline,
+            zs_spline,
+            vs_spline,
+            S_spline,
+            rolls_spline,
+            pitchs_spline,
+            yaws_spline,
+        ) = spline_sample_closed(
             self.ctrl_pts,
             max(200, len(self.ctrl_pts) * 10),
             self.cs_vel_current,
             self.s_max,
+            self.cs_z_current,  # Pass current Z spline
+            self.cs_roll_current,
+            self.cs_pitch_current,
+            self.cs_yaw_current,
         )
 
         # Remove the existing red spline
@@ -750,10 +1096,22 @@ class MainWindow(QMainWindow):
             New number of control points from the slider
         """
         self.num_samples = value
-        xs, ys, vs, S = spline_sample_closed(
-            self.static_pts, self.num_samples, self.cs_vel_initial, self.s_max
+        xs, ys, zs, vs, S, rolls, pitchs, yaws = spline_sample_closed(
+            self.static_pts,
+            self.num_samples,
+            self.cs_vel_initial,
+            self.s_max,
+            self.cs_z_initial,
+            self.cs_roll_initial,
+            self.cs_pitch_initial,
+            self.cs_yaw_initial,
         )
         self.ctrl_pts = list(zip(xs[:-1], ys[:-1]))
+        self.ctrl_z = zs[:-1]  # Update z for new control points
+        self.ctrl_roll = rolls[:-1]
+        self.ctrl_pitch = pitchs[:-1]
+        self.ctrl_yaw = yaws[:-1]
+
         self.draggable.positions = self.ctrl_pts.copy()
         self.draggable.setData(pos=self.ctrl_pts, data=list(range(len(self.ctrl_pts))))
         self.update_spline(self.ctrl_pts)
@@ -774,6 +1132,70 @@ class MainWindow(QMainWindow):
         """
         self.ctrl_pts = ctrl_pts
         s_ctrl_path_current = self._get_arc_lengths_for_path_ctrl_pts(self.ctrl_pts)
+
+        # Update Z coordinates for control points based on closest original Z
+        if len(self.ctrl_pts) > 0 and len(self.static_pts) > 0 and len(self.z_orig) > 0:
+            new_ctrl_z = []
+            new_ctrl_roll = []
+            new_ctrl_pitch = []
+            new_ctrl_yaw = []
+            static_arr = np.array(self.static_pts)
+            for x_ctrl, y_ctrl in self.ctrl_pts:
+                dists = np.hypot(static_arr[:, 0] - x_ctrl, static_arr[:, 1] - y_ctrl)
+                idx = int(np.argmin(dists))
+                new_ctrl_z.append(self.z_orig[idx] if idx < len(self.z_orig) else 0.0)
+                new_ctrl_roll.append(
+                    self.roll_orig[idx] if idx < len(self.roll_orig) else 0.0
+                )
+                new_ctrl_pitch.append(
+                    self.pitch_orig[idx] if idx < len(self.pitch_orig) else 0.0
+                )
+                new_ctrl_yaw.append(
+                    self.yaw_orig[idx] if idx < len(self.yaw_orig) else 0.0
+                )
+            self.ctrl_z = np.array(new_ctrl_z)
+            self.ctrl_roll = np.array(new_ctrl_roll)
+            self.ctrl_pitch = np.array(new_ctrl_pitch)
+            self.ctrl_yaw = np.array(new_ctrl_yaw)
+
+            if (
+                len(s_ctrl_path_current) == len(self.ctrl_z)
+                and len(s_ctrl_path_current) > 1
+            ):
+                # Ensure periodicity for z, roll, pitch, yaw
+                self.ctrl_z[-1] = self.ctrl_z[0]
+                self.ctrl_roll[-1] = self.ctrl_roll[0]
+                self.ctrl_pitch[-1] = self.ctrl_pitch[0]
+                self.ctrl_yaw[-1] = self.ctrl_yaw[0]
+
+                self.cs_z_current = CubicSpline(
+                    s_ctrl_path_current, self.ctrl_z, bc_type="periodic"
+                )
+                self.cs_roll_current = CubicSpline(
+                    s_ctrl_path_current, self.ctrl_roll, bc_type="periodic"
+                )
+                self.cs_pitch_current = CubicSpline(
+                    s_ctrl_path_current, self.ctrl_pitch, bc_type="periodic"
+                )
+                self.cs_yaw_current = CubicSpline(
+                    s_ctrl_path_current, self.ctrl_yaw, bc_type="periodic"
+                )
+            elif len(s_ctrl_path_current) == 1 and len(self.ctrl_z) == 1:
+                self.cs_z_current = lambda x: np.full_like(x, self.ctrl_z[0])
+                self.cs_roll_current = lambda x: np.full_like(x, self.ctrl_roll[0])
+                self.cs_pitch_current = lambda x: np.full_like(x, self.ctrl_pitch[0])
+                self.cs_yaw_current = lambda x: np.full_like(x, self.ctrl_yaw[0])
+            else:  # Fallback if lengths don't match
+                self.cs_z_current = lambda x: np.zeros_like(x)
+                self.cs_roll_current = lambda x: np.zeros_like(x)
+                self.cs_pitch_current = lambda x: np.zeros_like(x)
+                self.cs_yaw_current = lambda x: np.zeros_like(x)
+        else:  # No control points or no original z data
+            self.cs_z_current = lambda x: np.zeros_like(x)
+            self.cs_roll_current = lambda x: np.zeros_like(x)
+            self.cs_pitch_current = lambda x: np.zeros_like(x)
+            self.cs_yaw_current = lambda x: np.zeros_like(x)
+
         if len(s_ctrl_path_current) > 0:
             pts_arr = np.array(self.ctrl_pts)
             if len(pts_arr) > 1:
@@ -875,11 +1297,15 @@ class MainWindow(QMainWindow):
             self.cs_vel_current = lambda x: np.zeros_like(x)
             self.draggable_vel.update_positions([], [])
 
-        xs, ys, vs, S = spline_sample_closed(
+        xs, ys, zs, vs, S, rolls, pitchs, yaws = spline_sample_closed(
             self.ctrl_pts,
             max(200, len(self.ctrl_pts) * 10),
             self.cs_vel_current,
             self.s_max,
+            self.cs_z_current,  # Pass current Z spline
+            self.cs_roll_current,
+            self.cs_pitch_current,
+            self.cs_yaw_current,
         )
 
         # Remove the existing simple red spline
@@ -949,12 +1375,6 @@ class MainWindow(QMainWindow):
             # If no data, just update the red line
             self.vel_spline.setData(S, vs)
 
-        count = len(self.ctrl_pts)
-        self.slider.blockSignals(True)
-        self.slider.setValue(min(count, self.slider.maximum()))
-        self.slider.blockSignals(False)
-        self.slider_label.setText(f"Points: {count}")
-
     def save_csv(self):
         """
         Save the modified trajectory to a CSV file.
@@ -972,15 +1392,29 @@ class MainWindow(QMainWindow):
         """
         new_csv_path = self.csv_path.replace(".csv", "_modified.csv")
 
-        xs, ys, vs, S = spline_sample_closed(
-            self.ctrl_pts, 1000, self.cs_vel_current, self.s_max
+        xs, ys, zs, vs, S, rolls, pitchs, yaws = spline_sample_closed(
+            self.ctrl_pts,
+            1000,
+            self.cs_vel_current,
+            self.s_max,
+            self.cs_z_current,
+            self.cs_roll_current,
+            self.cs_pitch_current,
+            self.cs_yaw_current,
         )
         x_np = xs
         y_np = ys
+        z_np = zs  # Get z coordinates
         vx_np = vs
+        roll_np = rolls
+        pitch_np = pitchs
+        # yaw_np = yaws # We will use psi for yaw for now as per original logic
+
         dx = np.gradient(x_np, edge_order=2)
         dy = np.gradient(y_np, edge_order=2)
-        psi = np.arctan2(dy, dx)
+        psi = np.arctan2(
+            dy, dx
+        )  # This is effectively yaw if z changes are small or not affecting heading calc
         x_ext = np.concatenate((x_np[-2:], x_np, x_np[:2]))
         y_ext = np.concatenate((y_np[-2:], y_np, y_np[:2]))
         dx_dt = np.gradient(x_ext, edge_order=2)
@@ -997,16 +1431,23 @@ class MainWindow(QMainWindow):
                 "s_m": S,
                 "x_m": x_np,
                 "y_m": y_np,
-                "psi_rad": psi,
+                "psi_rad": psi,  # Using psi as yaw
                 "kappa_radpm": kappa,
                 "vx_mps": vx_np,
                 "ax_mps2": ax,
+                "z_m": z_np,  # Add z data
+                "roll_rad": roll_np,
+                "pitch_rad": pitch_np,
+                "yaw_rad": yaws,  # Use the direct yaw from spline
             }
         )
         with open(new_csv_path, "w") as f:
             f.write("#\n")
             f.write("#\n")
-            f.write("# s_m; x_m; y_m; psi_rad; kappa_radpm; vx_mps; ax_mps2\n")
+            f.write(
+                "# s_m; x_m; y_m; z_m; psi_rad; kappa_radpm; vx_mps; ax_mps2; roll_rad; pitch_rad; yaw_rad\n"
+            )
+        df_out = df_out.iloc[:-1]
         df_out.to_csv(
             new_csv_path,
             sep=";",
@@ -1051,11 +1492,15 @@ class MainWindow(QMainWindow):
         self.draggable_vel.update_positions(s_ctrl, v_new)
 
         # Sample the updated spline
-        xs, ys, vs, S = spline_sample_closed(
+        xs, ys, zs, vs, S, rolls, pitchs, yaws = spline_sample_closed(
             self.ctrl_pts,
             max(200, len(self.ctrl_pts) * 10),
             self.cs_vel_current,
             self.s_max,
+            self.cs_z_current,  # Pass current Z spline
+            self.cs_roll_current,
+            self.cs_pitch_current,
+            self.cs_yaw_current,
         )
 
         # Update position plot with colored spline
@@ -1123,6 +1568,226 @@ class MainWindow(QMainWindow):
         else:
             # If no data, just update the red line
             self.vel_spline.setData(S, vs)
+
+    def on_point_selected(self, point_type, index):
+        self.current_edit_type = point_type
+        self.current_edit_index = index
+
+        # Highlight the point in both scatter plots
+        if point_type == "position":
+            self.draggable.highlight_point(index)
+            self.draggable_vel.highlight_point(
+                index
+            )  # Also highlight corresponding velocity point
+        elif point_type == "velocity":
+            self.draggable_vel.highlight_point(index)
+            self.draggable.highlight_point(
+                index
+            )  # Also highlight corresponding position point
+
+        if index is None:
+            self.point_index_label.setText("No point selected")
+            self.clear_and_disable_edits()
+        else:
+            # Update the editor fields based on the selected point
+            if point_type == "position":
+                x, y = self.draggable.positions[index]
+                self.x_edit.setText(f"{x:.3f}")
+                self.y_edit.setText(f"{y:.3f}")
+                self.x_edit.setEnabled(True)
+                self.y_edit.setEnabled(True)
+
+                # Update Z, Roll, Pitch, Yaw fields
+                self.z_edit.setText(f"{self.ctrl_z[index]:.3f}")
+                self.z_edit.setEnabled(True)
+                self.roll_edit.setText(f"{self.ctrl_roll[index]:.3f}")
+                self.roll_edit.setEnabled(True)
+                self.pitch_edit.setText(f"{self.ctrl_pitch[index]:.3f}")
+                self.pitch_edit.setEnabled(True)
+                self.yaw_edit.setText(f"{self.ctrl_yaw[index]:.3f}")
+                self.yaw_edit.setEnabled(True)
+
+                self.v_edit.setText(f"{self.draggable_vel.v_coords[index]:.2f}")
+                self.v_edit.setEnabled(True)
+
+            elif point_type == "velocity":
+                self.point_index_label.setText(f"Velocity Point {index}")
+                # For velocity points, we might only want to edit V, or also show associated X,Y,Z,Roll,Pitch,Yaw
+                # For now, let's assume we edit V and show others as read-only or based on the linked position point
+                self.x_edit.setText(f"{self.ctrl_pts[index][0]:.2f}")
+                self.x_edit.setEnabled(False)  # X from position point
+                self.y_edit.setText(f"{self.ctrl_pts[index][1]:.2f}")
+                self.y_edit.setEnabled(False)  # Y from position point
+                self.z_edit.setText(f"{self.ctrl_z[index]:.3f}")
+                self.z_edit.setEnabled(False)  # Z from position point
+                self.roll_edit.setText(f"{self.ctrl_roll[index]:.3f}")
+                self.roll_edit.setEnabled(False)
+                self.pitch_edit.setText(f"{self.ctrl_pitch[index]:.3f}")
+                self.pitch_edit.setEnabled(False)
+                self.yaw_edit.setText(f"{self.ctrl_yaw[index]:.3f}")
+                self.yaw_edit.setEnabled(False)
+
+                self.v_edit.setText(f"{self.draggable_vel.v_coords[index]:.2f}")
+                self.v_edit.setEnabled(True)
+            else:
+                self.clear_and_disable_edits()
+
+    def clear_and_disable_edits(self):
+        """Clear and disable all point editing fields."""
+        self.x_edit.clear()
+        self.y_edit.clear()
+        self.z_edit.clear()
+        self.v_edit.clear()
+        self.roll_edit.clear()
+        self.pitch_edit.clear()
+        self.yaw_edit.clear()
+
+        self.x_edit.setEnabled(False)
+        self.y_edit.setEnabled(False)
+        self.z_edit.setEnabled(False)
+        self.v_edit.setEnabled(False)
+        self.roll_edit.setEnabled(False)
+        self.pitch_edit.setEnabled(False)
+        self.yaw_edit.setEnabled(False)
+
+    def apply_point_edit(self):
+        """Apply changes from the text fields to the selected point."""
+        if not hasattr(self, "current_edit_type") or not hasattr(
+            self, "current_edit_index"
+        ):
+            return
+
+        try:
+            if self.current_edit_type == "position":
+                # Update position point
+                if self.current_edit_index >= len(self.draggable.positions):
+                    return
+
+                x_text = self.x_edit.text().strip()
+                y_text = self.y_edit.text().strip()
+                z_text = self.z_edit.text().strip()  # Get Z
+                v_text = self.v_edit.text().strip()
+                roll_text = self.roll_edit.text().strip()
+                pitch_text = self.pitch_edit.text().strip()
+                yaw_text = self.yaw_edit.text().strip()
+
+                if x_text and y_text:  # Both X and Y must be provided
+                    x = float(x_text)
+                    y = float(y_text)
+                    z = (
+                        float(z_text)
+                        if z_text
+                        else self.ctrl_z[self.current_edit_index]
+                    )  # Use existing if empty
+                    roll = (
+                        float(roll_text)
+                        if roll_text
+                        else self.ctrl_roll[self.current_edit_index]
+                    )
+                    pitch = (
+                        float(pitch_text)
+                        if pitch_text
+                        else self.ctrl_pitch[self.current_edit_index]
+                    )
+                    yaw = (
+                        float(yaw_text)
+                        if yaw_text
+                        else self.ctrl_yaw[self.current_edit_index]
+                    )
+
+                    # Update position
+                    self.draggable.positions[self.current_edit_index] = (x, y)
+                    # Update Z, Roll, Pitch, Yaw
+                    self.ctrl_z[self.current_edit_index] = z
+                    self.ctrl_roll[self.current_edit_index] = roll
+                    self.ctrl_pitch[self.current_edit_index] = pitch
+                    self.ctrl_yaw[self.current_edit_index] = yaw
+
+                    self.draggable.setData(
+                        pos=self.draggable.positions,
+                        data=list(range(len(self.draggable.positions))),
+                    )
+
+                    # Update spline representation
+                    self.update_spline(self.draggable.positions)
+
+                    # If velocity was also provided, update it
+                    if v_text:
+                        v = max(0, float(v_text))  # Ensure non-negative
+
+                        # If we have velocities, update the selected point's velocity
+                        if len(self.draggable_vel.s_coords) > self.current_edit_index:
+                            self.draggable_vel.v_coords[self.current_edit_index] = v
+
+                            # Update any linked points (periodic constraints)
+                            if (
+                                self.draggable_vel.is_periodic
+                                and len(self.draggable_vel.v_coords) > 1
+                            ):
+                                if self.current_edit_index == 0:
+                                    self.draggable_vel.v_coords[-1] = v
+                                elif (
+                                    self.current_edit_index
+                                    == len(self.draggable_vel.v_coords) - 1
+                                ):
+                                    self.draggable_vel.v_coords[0] = v
+
+                            # Update velocity plot
+                            self.draggable_vel.update_positions(
+                                self.draggable_vel.s_coords, self.draggable_vel.v_coords
+                            )
+
+                            # Update spline representation with new velocity
+                            self.handle_velocity_drag(
+                                self.draggable_vel.s_coords, self.draggable_vel.v_coords
+                            )
+
+            elif self.current_edit_type == "velocity":
+                # Update only velocity for velocity points
+                if self.current_edit_index >= len(self.draggable_vel.v_coords):
+                    return
+
+                v_text = self.v_edit.text().strip()
+                if v_text:
+                    v = max(0, float(v_text))  # Ensure non-negative
+
+                    # Update velocity
+                    self.draggable_vel.v_coords[self.current_edit_index] = v
+
+                    # Update any linked points (periodic constraints)
+                    if (
+                        self.draggable_vel.is_periodic
+                        and len(self.draggable_vel.v_coords) > 1
+                    ):
+                        if self.current_edit_index == 0:
+                            self.draggable_vel.v_coords[-1] = v
+                        elif (
+                            self.current_edit_index
+                            == len(self.draggable_vel.v_coords) - 1
+                        ):
+                            self.draggable_vel.v_coords[0] = v
+
+                    # Update velocity plot
+                    self.draggable_vel.update_positions(
+                        self.draggable_vel.s_coords, self.draggable_vel.v_coords
+                    )
+
+                    # Update spline representation
+                    self.handle_velocity_drag(
+                        self.draggable_vel.s_coords, self.draggable_vel.v_coords
+                    )
+
+        except ValueError:
+            # Invalid numerical input
+            pass
+
+        # Re-enable text fields in case they were disabled
+        self.x_edit.setEnabled(True)
+        self.y_edit.setEnabled(True)
+        self.z_edit.setEnabled(True)
+        self.roll_edit.setEnabled(True)
+        self.pitch_edit.setEnabled(True)
+        self.yaw_edit.setEnabled(True)
 
 
 if __name__ == "__main__":
