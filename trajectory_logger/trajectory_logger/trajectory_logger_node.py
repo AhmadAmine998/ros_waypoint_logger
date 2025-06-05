@@ -14,10 +14,11 @@ import pandas as pd
 import os
 from pathlib import Path
 from context_msgs.msg import STCombined, STControl
+import argparse
 
 
 class TrajectoryLogger(Node):
-    def __init__(self):
+    def __init__(self, file_name="trajectory_log.csv"):
         super().__init__("trajectory_logger")
 
         qos_profile = QoSProfile(
@@ -52,10 +53,11 @@ class TrajectoryLogger(Node):
         self.omega_ys = []
         self.omega_zs = []
         self.min_num_points = 100
-        self.loop_back_threshold = 0.2
+        self.loop_back_threshold = 0.5
 
         self.output_dir = Path(os.getcwd()) / "trajectory_logs"
         self.output_dir.mkdir(exist_ok=True)
+        self.save_file_name = file_name
 
         self.get_logger().info("Trajectory logger node started.")
 
@@ -104,6 +106,7 @@ class TrajectoryLogger(Node):
         self.timestamps.append(now)
         self.xs.append(x)
         self.ys.append(y)
+        self.zs.append(z)
         self.vxs.append(vx)
         self.vys.append(vy)
         self.vzs.append(vz)
@@ -180,12 +183,12 @@ class TrajectoryLogger(Node):
                 }
             )
 
-            output_path = self.output_dir / "trajectory_log.csv"
+            output_path = self.output_dir / self.save_file_name
 
             with open(output_path, "w") as f:
                 f.write("#\n")
                 f.write("#\n")
-                f.write("# s_m; x_m; y_m; psi_rad; kappa_radpm; vx_mps; ax_mps2\n")
+                f.write("# s_m; x_m; y_m; psi_rad; kappa_radpm; vx_mps; ax_mps2; z_m; theta_rad; phi_rad; vy_mps; vz_mps\n")
             df.to_csv(
                 output_path,
                 sep=";",
@@ -206,9 +209,20 @@ class TrajectoryLogger(Node):
 
 
 def main(args=None):
+    parser = argparse.ArgumentParser(description="Trajectory Logger Node")
+    parser.add_argument(
+        "--file_name",
+        type=str,
+        default="trajectory_log.csv",
+        help="Name of the output file to save the trajectory data.",
+    )
+    parsed_args, unknown = parser.parse_known_args()
+    if parsed_args.file_name:
+        print(f"Using output file: {parsed_args.file_name}")
+
     rclpy.init(args=args)
     print("Starting logger node...")
-    node = TrajectoryLogger()
+    node = TrajectoryLogger(file_name=parsed_args.file_name)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
